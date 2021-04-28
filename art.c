@@ -42,12 +42,16 @@ static art_node* alloc_node(uint8_t type) {
             break;
         case NODE4LEAF:
             n = (art_node*)calloc(1, sizeof(art_node4_leaf));
+            break;
         case NODE16LEAF:
             n = (art_node*)calloc(1, sizeof(art_node16_leaf));
+            break;
         case NODE48LEAF:
             n = (art_node*)calloc(1, sizeof(art_node48_leaf));
+            break;
         case NODE256LEAF:
             n = (art_node*)calloc(1, sizeof(art_node256_leaf));
+            break;
         default:
             abort();
     }
@@ -71,8 +75,12 @@ static void destroy_node(art_node *n) {
     if (!n) return;
 
     // Special case leafs
-    if (IS_LEAF(n)) {
-        free(LEAF_RAW(n));
+//    if (IS_LEAF(n)) {
+//        free(LEAF_RAW(n));
+//        return;
+//    }
+    if(n->type > 4){
+        free(n);
         return;
     }
 
@@ -115,7 +123,6 @@ static void destroy_node(art_node *n) {
                     destroy_node(p.p4->children[i]);
             }
             break;
-
         default:
             abort();
     }
@@ -392,10 +399,7 @@ static int find_child_leaf(art_node* n, unsigned char c, bool direction, int *bo
             }
             break;
         case NODE16LEAF:
-
-        case NODE16:
             p.p2 = (art_node16_leaf*)n;
-
             // support non-86 architectures
 #ifdef __i386__
             // Compare the key to all 16 stored keys
@@ -414,8 +418,10 @@ static int find_child_leaf(art_node* n, unsigned char c, bool direction, int *bo
                 __m128i cmp;
                 //FIXME:处理direction
                 // Use a mask to ignore children that don't exist
-                mask = (1 << n->num_children) - 1;
-                bitfield = _mm_movemask_epi8(cmp) & mask;
+                mask = (1 << (n->num_children+1)) - 1;
+            cmp = _mm_cmpeq_epi8(_mm_set1_epi8(c),
+                                 _mm_loadu_si128((__m128i*)p.p2->keys));
+            bitfield = _mm_movemask_epi8(cmp) & mask;
 #else
             // Compare the key to all 16 stored keys
             bitfield = 0;
@@ -429,17 +435,13 @@ static int find_child_leaf(art_node* n, unsigned char c, bool direction, int *bo
             bitfield &= mask;
 #endif
 #endif
-
             /*
              * If we have a match (any bit set) then we can
              * return the pointer match using ctz to get
              * the index.
              */
             if (bitfield){
-                if(direction)
-                    return __builtin_ctz(bitfield);
-                else
-                    return 31-__builtin_clz(bitfield);
+                return __builtin_ctz(bitfield);
             }
             break;
         case NODE48LEAF:
@@ -549,14 +551,14 @@ void* art_search(const art_tree *t, const unsigned char *key, int key_len) {
     int prefix_len, depth = 0;
     while (n) {
         // Might be a leaf
-        if (IS_LEAF(n)) {
-            n = (art_node*)LEAF_RAW(n);
-            // Check if the expanded path matches
-            if (!leaf_matches((art_leaf*)n, key, key_len, depth)) {
-                return ((art_leaf*)n)->value;
-            }
-            return NULL;
-        }
+//        if (IS_LEAF(n)) {
+//            n = (art_node*)LEAF_RAW(n);
+//            // Check if the expanded path matches
+//            if (!leaf_matches((art_leaf*)n, key, key_len, depth)) {
+//                return ((art_leaf*)n)->value;
+//            }
+//            return NULL;
+//        }
 
         // Bail if the prefix does not match
         //this is path compression of the paper. If prefix exists, need to compare and skip
@@ -565,6 +567,17 @@ void* art_search(const art_tree *t, const unsigned char *key, int key_len) {
             if (prefix_len != min(MAX_PREFIX_LEN, n->partial_len))
                 return NULL;
             depth = depth + n->partial_len;
+        }
+
+        if(n->type > 4){ // if n is a leaf node
+            int *border;
+            //ATTENTION: here the position l is pos+1
+            int l = find_child_leaf(n, key[depth], true, border);
+            if(l != -1){
+                return get_leaf(n, l)->value;
+            } else {
+                return NULL;
+            }
         }
 
         // Recursively search
@@ -679,11 +692,11 @@ static art_node* make_leaf(const unsigned char *key, int key_len, void *value, i
     // l->n partial_len, partial, num_children
     l->n.num_children = 1;
     l->n.partial_len = min(MAX_PREFIX_LEN, key_len - depth - 1);
-    memcpy(l->n.partial, key+depth+1, l->n.partial_len);
+    memcpy(l->n.partial, key+depth, l->n.partial_len);
     l->n.type = 5;
-    l->keys[0] = key[depth];
+    l->keys[0] = key[depth+l->n.partial_len];
 
-    init_leaf_array(l->children);
+//    init_leaf_array(l->children);
     memcpy(l->children[0].key, key, key_len);
     l->children[0].key_len = key_len;
     l->children[0].value = value;
@@ -896,13 +909,12 @@ static void add_child16_leaf(art_node16_leaf *n, art_node** ref,
                              int depth, const unsigned char *key,
                              int key_len, void* value){
     char c = key[depth];
-    int idx = 0;
-    if(n->n.num_children < 16){
+    if (n->n.num_children < 16) {
         unsigned mask = (1 << n->n.num_children) - 1;
 
-        //support non-x86 architectures
-        #ifdef __i386__
-             __m128i cmp;
+        // support non-x86 architectures
+#ifdef __i386__
+        __m128i cmp;
 
             // Compare the key to all 16 stored keys
             cmp = _mm_cmplt_epi8(_mm_set1_epi8(c),
@@ -910,38 +922,41 @@ static void add_child16_leaf(art_node16_leaf *n, art_node** ref,
 
             // Use a mask to ignore children that don't exist
             unsigned bitfield = _mm_movemask_epi8(cmp) & mask;
-            #else
-        #ifdef __amd64__
-            __m128i cmp;
+#else
+#ifdef __amd64__
+        __m128i cmp;
 
-            // Compare the key to all 16 stored keys
-            cmp = _mm_cmplt_epi8(_mm_set1_epi8(c),
-                    _mm_loadu_si128((__m128i*)n->keys));
+        // Compare the key to all 16 stored keys
+        cmp = _mm_cmplt_epi8(_mm_set1_epi8(c),
+                             _mm_loadu_si128((__m128i*)n->keys));
 
-            // Use a mask to ignore children that don't exist
-            unsigned bitfield = _mm_movemask_epi8(cmp) & mask;
-        #else
-             // Compare the key to all 16 stored keys
+        // Use a mask to ignore children that don't exist
+        unsigned bitfield = _mm_movemask_epi8(cmp) & mask;
+#else
+        // Compare the key to all 16 stored keys
             unsigned bitfield = 0;
             for (short i = 0; i < 16; ++i) {
-                 if (c < n->keys[i])
-                     bitfield |= (1 << i);
+                if (c < n->keys[i])
+                    bitfield |= (1 << i);
             }
 
             // Use a mask to ignore children that don't exist
             bitfield &= mask;
-        #endif
-            #endif
-            //check if less than ANY
-            if(bitfield){
-                idx = __builtin_ctz(bitfield);
-                memmove(n->keys+idx+1, n->keys+idx, n->n.num_children - idx);
-                memmove(n->children+idx+1, n->children+idx,
-                        (n->n.num_children - idx)*sizeof(void*));
-            } else
-                idx = n->n.num_children;
+#endif
+#endif
+
+        // Check if less than any
+        unsigned idx;
+        if (bitfield) {
+            idx = __builtin_ctz(bitfield);
+            memmove(n->keys+idx+1,n->keys+idx,n->n.num_children-idx);
+            memmove(n->children+idx+1,n->children+idx,
+                    (n->n.num_children-idx)*sizeof(void*));
+        } else
+            idx = n->n.num_children;
             //FIXME：上面的代码都是照抄的，不知道是不是符合要求。
             //set the child
+            n->n.num_children++;
             n->keys[idx] = key[depth];
             n->children[idx].key_len = key_len;
             n->children[idx].value = value;
@@ -974,6 +989,7 @@ static void add_child4_leaf(art_node4_leaf *n, art_node** ref,
         }
         //FIXME:为了保持节点内有序，所有需要先得到c应当插入的位置，并将后续的数据后移一位，这里直接用了前面的，应该是不对的。
         memmove(n->keys+idx+1, n->keys+idx, n->n.num_children - idx);
+        //FIXME: here maybe use sizeof(art_leaf)
         memmove(n->children+idx+1, n->children+idx,
                 (n->n.num_children - idx)*sizeof(void*));
 
@@ -993,6 +1009,7 @@ static void add_child4_leaf(art_node4_leaf *n, art_node** ref,
         copy_header((art_node*)new_node, (art_node*)n);
         *ref = (art_node*)new_node;
         free(n);
+        //FIXME: here not work.
         add_child16_leaf(new_node, ref, depth, key, key_len, value);
     }
 }
@@ -1136,7 +1153,7 @@ static void* recursive_insert(art_node *n, art_node **ref, const unsigned char *
         art_node4 *new_node = (art_node4 *) alloc_node(NODE4);
         *ref = (art_node *) new_node;
         new_node->n.partial_len = prefix_diff;
-        memcpy(new_node->n.partial, n->partial, min(MAX_PREFIX_LEN, n->partial_len));
+        memcpy(new_node->n.partial, n->partial, min(MAX_PREFIX_LEN, new_node->n.partial_len));
 
         //调整原先的节点n的前缀
         //ATTENTION: art_node n has been added to new_node.
@@ -1175,11 +1192,11 @@ static void* recursive_insert(art_node *n, art_node **ref, const unsigned char *
         } else {
             //leaf node, need consider the case of the key found not equal to the insert key.
             //还需要写一个在叶子结点查询的函数
-            //TODO：写一个find_child_leaf函数，返回指向art_leaf的指针 or return the position number?
+            //写一个find_child_leaf函数，返回指向art_leaf的指针 or return the position number?
             int *border;
             int l = find_child_leaf(n, key[depth], true, border);
             if(l != -1){
-                art_leaf *leaf = get_leaf(n, l);
+                art_leaf *leaf = get_leaf(n, l-1);
                 //有孩子，这里需要判断是否相等
                 if(!leaf_matches(leaf, key, key_len, depth)){//如果key相等，memcmp函数是相等返回0
                     *old = 1;

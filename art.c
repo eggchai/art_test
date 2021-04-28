@@ -691,12 +691,11 @@ static art_node* make_leaf(const unsigned char *key, int key_len, void *value, i
     art_node4_leaf *l = (art_node4_leaf*)calloc(1, sizeof(art_node4_leaf));
     // l->n partial_len, partial, num_children
     l->n.num_children = 1;
-    l->n.partial_len = min(MAX_PREFIX_LEN, key_len - depth - 1);
-    memcpy(l->n.partial, key+depth, l->n.partial_len);
+    l->n.partial_len = key_len - depth - 1;
+    memcpy(l->n.partial, key+depth, min(MAX_PREFIX_LEN, l->n.partial_len));
     l->n.type = 5;
-    l->keys[0] = key[depth+l->n.partial_len];
+    l->keys[0] = key[depth + l->n.partial_len];
 
-//    init_leaf_array(l->children);
     memcpy(l->children[0].key, key, key_len);
     l->children[0].key_len = key_len;
     l->children[0].value = value;
@@ -1131,6 +1130,16 @@ static int prefix_mismatch(const art_node *n, const unsigned char *key, int key_
     return idx;
 }
 
+static int string_dismatch(const unsigned char *key1, const unsigned char *key2, int key_len, int depth){
+    int max_cmp = key_len - depth;
+    int idx;
+    for(idx = depth; idx < max_cmp; idx++){
+        if(key1[idx] != key2[idx])
+            return idx;
+    }
+    return depth;
+}
+
 // Recursive insert
 static void* recursive_insert(art_node *n, art_node **ref, const unsigned char *key, int key_len, void *value, int depth, int *old, int replace) {
     // If we are at a NULL node, inject a leaf
@@ -1155,10 +1164,9 @@ static void* recursive_insert(art_node *n, art_node **ref, const unsigned char *
         new_node->n.partial_len = prefix_diff;
         memcpy(new_node->n.partial, n->partial, min(MAX_PREFIX_LEN, new_node->n.partial_len));
 
-        //调整原先的节点n的前缀
-        //ATTENTION: art_node n has been added to new_node.
+        //调整原先的节点n的前缀, and keys of n
         if (n->partial_len <= MAX_PREFIX_LEN) { //n中的前缀是完全的
-            add_child4(new_node, ref, n->partial[prefix_diff], n);
+            add_child4(new_node, ref, n->partial[prefix_diff+1], n);
             n->partial_len -= (prefix_diff + 1);
             memmove(n->partial, n->partial + prefix_diff + 1,
                     min(MAX_PREFIX_LEN, n->partial_len));
@@ -1199,15 +1207,31 @@ static void* recursive_insert(art_node *n, art_node **ref, const unsigned char *
                 art_leaf *leaf = get_leaf(n, l-1);
                 //有孩子，这里需要判断是否相等
                 if(!leaf_matches(leaf, key, key_len, depth)){//如果key相等，memcmp函数是相等返回0
+                    //the same key, only need to update
                     *old = 1;
                     void *old_val = leaf->value;
                     if(replace) leaf->value = value;
                     return old_val;
+                } else {
+                    //not same key
+                    if(n->num_children == 1){
+                        //for this case, the prefix is matched, it's the MAX_PREFIX_LEN is too short and path compression.
+                        // we only need to modify keys[0]
+                        //TODO: the case of n.num_children==1
+                        int diff = string_dismatch(leaf->key, key, key_len, depth);
+                        art_node4_leaf *node = (art_node4_leaf*)n;
+                        node->keys[0] = leaf->key[diff];
+                        node->keys[1] = key[diff];
+                        node->children[1].key_len = key_len;
+                        node->children[1].value = value;
+                        memcpy(node->children[1].key, key, key_len);
+                    } else {
+                        //先把这个叶子转化为中间节点，然后插入
+                        art_node *new_node = transform(n, depth);
+                        *ref = new_node;
+                        recursive_insert(new_node, ref, key, key_len, value, depth, old, replace);//下面要修改扫描整个节点的过程
+                    }
                 }
-                //先把这个叶子转化为中间节点，然后插入
-                art_node *new_node = transform(n, depth);
-                *ref = new_node;
-                recursive_insert(new_node, ref, key, key_len, value, depth, old, replace);//下面要修改扫描整个节点的过程
             } else {
                 //没有孩子的情况，直接插入
                 //FIXME: need get corresponding art_leaf

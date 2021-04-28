@@ -73,7 +73,7 @@ void test_insert_search(){
 
     int len;
     char buf[512];
-    FILE *f = fopen("/home/chen/CLionProjects/art_test/int.txt", "r");
+    FILE *f = fopen("/home/chen/CLionProjects/art_test/int_test.txt", "r");
 
     uintptr_t line = 1;
     while (fgets(buf, sizeof buf, f)) {
@@ -110,7 +110,7 @@ void test_insert_search(){
 int main() {
 //    test_init_and_destroy();
 //    dbg(sizeof(art_node256_leaf));
-    test_insert();
-//    test_insert_search();
+//    test_insert();
+    test_insert_search();
     return 0;
 }

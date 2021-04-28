@@ -17,7 +17,7 @@ extern "C" {
 #define NODE48LEAF 7
 #define NODE256LEAF 8
 
-#define MAX_PREFIX_LEN 10
+#define MAX_PREFIX_LEN 4
 
 #if defined(__GNUC__) && !defined(__clang__)
 # if __STDC_VERSION__ >= 199901L && 402 == (__GNUC__ * 100 + __GNUC_MINOR__)

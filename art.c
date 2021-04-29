@@ -461,6 +461,130 @@ static int find_child_leaf(art_node* n, unsigned char c, bool direction, int *bo
     return -1;
 }
 
+static int find_child_leaf_boundary(art_node *n, unsigned char c,
+                                    bool direction, int *border){
+    int i, mask, bitfield;
+    union {
+        art_node4_leaf *p1;
+        art_node16_leaf *p2;
+        art_node48_leaf *p3;
+        art_node256_leaf *p4;
+    } p;
+
+    switch (n->type) {
+        case NODE4LEAF:
+            p.p1 = (art_node4_leaf*)n;
+            if(direction){
+                *border = n->num_children - 1;
+                for(int i=0; i<n->num_children;i++){
+                    if(p.p1->keys[i] >= c)
+                        return i;
+                }
+                return -1;
+            } else {
+                *border = 0;
+                for(int i=n->num_children; i > -1; i--){
+                    if(p.p1->keys[i] <= c)
+                        return i;
+                }
+                return -1;
+            }
+            break;
+            {case NODE16LEAF:
+            p.p2 = (art_node16_leaf*)n;
+            // support non-86 architectures
+#ifdef __i386__
+            // Compare the key to all 16 stored keys
+                __m128i cmp;
+                cmp = _mm_cmpeq_epi8(_mm_set1_epi8(c),
+                        _mm_loadu_si128((__m128i*)p.p2->keys));
+
+                // Use a mask to ignore children that don't exist
+                mask = (1 << n->num_children) - 1;
+                bitfield = _mm_movemask_epi8(cmp) & mask;
+#else
+#ifdef __amd64__
+            // Compare the key to all 16 stored keys
+            //Variables of type _m128i are automatically
+            // aligned on 16-byte boundaries.
+            __m128i cmp;
+            if(direction){
+                cmp = _mm_cmplt_epi8(_mm_set1_epi8(c),
+                                     _mm_loadu_si128((__m128i*)p.p2->keys));
+                *border = n->num_children - 1;
+            }else{
+                cmp = _mm_cmpgt_epi8(_mm_set1_epi8(c),
+                                     _mm_loadu_si128((__m128i*)p.p2->keys));
+                *border = 0;
+            }
+            // Use a mask to ignore children that don't exist
+            mask = (1 << n->num_children) - 1;
+            bitfield = _mm_movemask_epi8(cmp) & mask;
+#else
+            // Compare the key to all 16 stored keys
+                bitfield = 0;
+                for (i = 0; i < 16; ++i) {
+                    if (p.p2->keys[i] == c)
+                        bitfield |= (1 << i);
+                }
+
+                // Use a mask to ignore children that don't exist
+                mask = (1 << n->num_children) - 1;
+                bitfield &= mask;
+#endif
+#endif
+
+            /*
+             * If we have a match (any bit set) then we can
+             * return the pointer match using ctz to get
+             * the index.
+             */
+            if (bitfield){
+                if(direction)
+                    return __builtin_ctz(bitfield);
+                else
+                    return 31 - __builtin_clz(bitfield);
+            }
+            break;
+        }
+        case NODE48LEAF:
+            p.p3 = (art_node48_leaf *)n;
+            if(direction){
+                *border = n->num_children - 1;
+                for(int i=c; i<256; i++){
+                    if(p.p3->keys[i])
+                        return i;
+                }
+            } else {
+                *border = 0;
+                for(int i=c; i>-1; i--){
+                    if(p.p3->keys[i])
+                        return i;
+                }
+            }
+            break;
+        case NODE256LEAF:
+            p.p4 = (art_node256_leaf*)n;
+            if(direction){
+                *border = 256;
+                for(int i=c; i<256; i++){
+                    if(p.p4->children[i].key_len)
+                        return i;
+                }
+                return -1;
+            } else {
+                *border = 0;
+                for(int i=c; i>-1; i--){
+                    if(p.p4->children[i].key_len)
+                        return i;
+                }
+                return -1;
+            }
+        default:
+            abort();
+    }
+}
+
 // Simple inlined if
 static inline int min(int a, int b) {
     return (a < b) ? a : b;
@@ -950,10 +1074,9 @@ static void add_child16_leaf(art_node16_leaf *n, art_node** ref,
             idx = __builtin_ctz(bitfield);
             memmove(n->keys+idx+1,n->keys+idx,n->n.num_children-idx);
             memmove(n->children+idx+1,n->children+idx,
-                    (n->n.num_children-idx)*sizeof(void*));
+                    (n->n.num_children-idx)*sizeof(art_leaf));
         } else
             idx = n->n.num_children;
-            //FIXME：上面的代码都是照抄的，不知道是不是符合要求。
             //set the child
             n->n.num_children++;
             n->keys[idx] = key[depth];
@@ -966,8 +1089,8 @@ static void add_child16_leaf(art_node16_leaf *n, art_node** ref,
         //将原来在Node16Leaf中的数据拷贝到新节点
         //因为是叶子节点，所以叶子结点中的数据需要一个一个全部拷贝
         for(int i=0; i<n->n.num_children; ++i){
-            new_node->keys[n->keys[i]] = i + 1;//FIXME:其他地方需要初始化为0吗
-            //FIXME:不清楚结构是否可以直接赋值
+            new_node->keys[n->keys[i]] = i + 1;
+            //FIXME:不清楚结构是否可以直接赋值, maybe should use memcpy
             new_node->children[i] = n->children[i];
         }
         copy_header((art_node*)new_node, (art_node*)n);
@@ -990,7 +1113,7 @@ static void add_child4_leaf(art_node4_leaf *n, art_node** ref,
         memmove(n->keys+idx+1, n->keys+idx, n->n.num_children - idx);
         //FIXME: here maybe use sizeof(art_leaf)
         memmove(n->children+idx+1, n->children+idx,
-                (n->n.num_children - idx)*sizeof(void*));
+                (n->n.num_children - idx)*sizeof(art_leaf));
 
         //插入
         n->keys[idx] = c;
@@ -1163,10 +1286,9 @@ static void* recursive_insert(art_node *n, art_node **ref, const unsigned char *
         *ref = (art_node *) new_node;
         new_node->n.partial_len = prefix_diff;
         memcpy(new_node->n.partial, n->partial, min(MAX_PREFIX_LEN, new_node->n.partial_len));
-
         //调整原先的节点n的前缀, and keys of n
         if (n->partial_len <= MAX_PREFIX_LEN) { //n中的前缀是完全的
-            add_child4(new_node, ref, n->partial[prefix_diff+1], n);
+            add_child4(new_node, ref, n->partial[prefix_diff], n);
             n->partial_len -= (prefix_diff + 1);
             memmove(n->partial, n->partial + prefix_diff + 1,
                     min(MAX_PREFIX_LEN, n->partial_len));
@@ -1217,7 +1339,7 @@ static void* recursive_insert(art_node *n, art_node **ref, const unsigned char *
                     if(n->num_children == 1){
                         //for this case, the prefix is matched, it's the MAX_PREFIX_LEN is too short and path compression.
                         // we only need to modify keys[0]
-                        //TODO: the case of n.num_children==1
+                        // the case of n.num_children==1
                         int diff = string_dismatch(leaf->key, key, key_len, depth);
                         art_node4_leaf *node = (art_node4_leaf*)n;
                         node->keys[0] = leaf->key[diff];
@@ -1286,7 +1408,6 @@ static void* recursive_insert(art_node *n, art_node **ref, const unsigned char *
 //    }  else {//叶子结点——先找到对应的key
 //        if(recursive_flag){
 //            //还需要写一个在叶子结点查询的函数
-//            //TODO：写一个find_child_leaf函数，返回指向art_leaf的指针
 //            int *border;
 //            int l = find_child_leaf(n, key[depth], true, border);
 //            if(l != -1){
@@ -1625,11 +1746,11 @@ void* art_delete(art_tree *t, const unsigned char *key, int key_len) {
 static int recursive_iter(art_node *n, art_callback cb, void *data) {
     // Handle base cases
     if (!n) return 0;
-    if (IS_LEAF(n)) {
-        art_leaf *l = LEAF_RAW(n);
-        //cb is a restriction, return 0 continue iteration, else stop iteration
-        return cb(data, (const unsigned char*)l->key, l->key_len, l->value);
-    }
+//    if (IS_LEAF(n)) {
+//        art_leaf *l = LEAF_RAW(n);
+//        //cb is a restriction, return 0 continue iteration, else stop iteration
+//        return cb(data, (const unsigned char*)l->key, l->key_len, l->value);
+//    }
 
     int idx, res;
     switch (n->type) {
@@ -1687,7 +1808,6 @@ static int recursive_iter(art_node *n, art_callback cb, void *data) {
                 }
             }
             break;}
-            //case NODE256LEAF?
         case NODE256LEAF:{
             art_node256_leaf *l256 = (art_node256_leaf*)n;
             for(int i=0; i<n->num_children; i++){
@@ -1717,6 +1837,62 @@ int art_iter(art_tree *t, art_callback cb, void *data) {
     return recursive_iter(t->root, cb, data);
 }
 
+int range_query_leaf_boundary(art_node *n, art_callback cb, void *data,
+                              int depth, const unsigned char *key,
+                              int key_len, bool direction){
+    union {
+        art_node4_leaf *p1;
+        art_node16_leaf *p2;
+        art_node48_leaf *p3;
+        art_node256_leaf *p4;
+    } p;
+    int *border;
+    int pos = find_child_leaf(n, key[depth], direction, border);
+    int left, right;
+    if(direction){
+        left = pos;
+        right = *border;
+    } else {
+        left = border;
+        right = pos;
+    }
+    switch (n->type) {
+        case NODE4LEAF:
+            p.p1 = (art_node4_leaf*)n;
+            while(left <= right){
+                cb(data, p.p1->children[left].key, p.p1->children[left].key_len, p.p1->children[left].value);
+                left++;
+            }
+            break;
+        case NODE16LEAF:
+            p.p2 = (art_node16_leaf*)n;
+            while(left <= right){
+                cb(data, p.p2->children[left].key, p.p2->children[left].key_len, p.p3->children[left].value);
+                left++;
+            }
+            break;
+        case NODE48LEAF:
+            p.p3 = (art_node48_leaf*)n;
+            while(left <= right){
+                cb(data, p.p3->children[left].key, p.p3->children[left].key_len, p.p3->children[left].value);
+                left++;
+            }
+            break;
+        case NODE256LEAF:
+            p.p4 = (art_node256_leaf*)n;
+            while(left <= right){
+                if(p.p4->children[left].key_len){
+                    cb(data, p.p4->children[left].key, p.p4->children[left].key_len, p.p4->children[left].value);
+                }
+                left++;
+            }
+            break;
+        default:
+            abort();
+    }
+    return 0;
+}
+
 int range_query_boundary(art_node *n, art_callback cb,
                               void *data, int depth,
                               const unsigned char *key, int key_len,
@@ -1726,10 +1902,10 @@ int range_query_boundary(art_node *n, art_callback cb,
     art_node **tmp = &n;
     art_node ***border = &tmp;
     //leaf node, return directly
-    if(IS_LEAF(n)){
-        art_leaf *l = (art_leaf*)LEAF_RAW(n);
-        return cb(data, (const unsigned char*)l->key, l->key_len, l->value);
-    }
+//    if(IS_LEAF(n)){
+//        art_leaf *l = (art_leaf*)LEAF_RAW(n);
+//        return cb(data, (const unsigned char*)l->key, l->key_len, l->value);
+//    }
     if (n->partial_len) {
         prefix_len = check_prefix_direction(n, key, key_len, depth);
         if(prefix_len == 0 && direction){
@@ -1743,6 +1919,12 @@ int range_query_boundary(art_node *n, art_callback cb,
         }else
             return 1;
     }
+
+    if(n->type > 4){
+        range_query_leaf_boundary(n, cb, data, depth, key, key_len, direction);
+        return 0;
+    }
+
     //for the function of find_child, if cant find, it will return NULL
     if(direction){
         child = find_child(n, key[depth], direction, border);
@@ -1793,6 +1975,62 @@ int range_query_boundary(art_node *n, art_callback cb,
     return 1;
 }
 
+int range_query_leaf(art_node* n, art_callback cb, void *data, int depth,
+                     const unsigned char *low, int low_len,
+                     const unsigned char *high, int high_len){
+    //use find_child_leaf and get_leaf to get art_leaf
+    union {
+        art_node4_leaf *p1;
+        art_node16_leaf *p2;
+        art_node48_leaf *p3;
+        art_node256_leaf *p4;
+    } p;
+    int *border1, *border2;
+    int left = find_child_leaf(n, low[depth], true, border1);
+    int right = find_child_leaf(n, high[depth], false, border2);
+    switch (n->type) {
+        case NODE4LEAF:
+            p.p1 = (art_node4_leaf*)n;
+            while(left <= right){
+                cb(data, p.p1->children[left].key,
+                   p.p1->children[left].key_len,
+                   p.p1->children[left].value);
+                left++;
+            }
+            break;
+        case NODE16LEAF:
+            p.p2 = (art_node16_leaf*)n;
+            while(left <= right){
+                cb(data, p.p2->children[left].key,
+                   p.p2->children[left].key_len,
+                   p.p2->children[left].value);
+                left++;
+            }
+            break;
+        case NODE48LEAF:
+            p.p3 = (art_node48_leaf*)n;
+            while(left <= right){
+                cb(data, p.p3->children[left].key,
+                   p.p3->children[left].key_len,
+                   p.p3->children[left].value);
+                left++;
+            }
+            break;
+        case NODE256LEAF:
+            p.p4 = (art_node256_leaf*)n;
+            while(left <= right){
+                if(p.p4->children[left].key_len){
+                    cb(data, p.p4->children[left].key,
+                       p.p4->children[left].key_len,
+                       p.p4->children[left].value);
+                }
+                left++;
+            }
+            break;
+    }
+}
+
+
 
 /**
  * Range Query
@@ -1806,24 +2044,19 @@ int range_query(art_node *n, art_callback cb,
                 void *data, int depth,
                 const unsigned char *low, int low_len,
                 const unsigned char *high, int high_len){
-    printf("range_query function\n");
     art_node **child1, **child2;
     art_node **tmp = &n;
     art_node ***border = &tmp;
     int prefix_len;
-    if(IS_LEAF(n)){
-        art_leaf *l = (art_leaf*)LEAF_RAW(n);
-        // Check if the expanded path matches
-        if (!leaf_matches(l, low, low_len, depth)) {
-            return cb(data, (const unsigned char*)l->key, l->key_len, l->value);
-        }
-        return 0;
-    }
     if (n->partial_len) {
         prefix_len = check_prefix(n, low, low_len, depth);
         if (prefix_len != min(MAX_PREFIX_LEN, n->partial_len))
             return 1;
         depth = depth + n->partial_len;
+    }
+    if(n->type > 4){
+        range_query_leaf(n, cb, data, depth, low, low_len, high, high_len);
+        return 0;
     }
     child1 = find_child(n, low[depth], true, border);
     child2 = find_child(n, high[depth], true, border);
@@ -1879,6 +2112,7 @@ int range_query(art_node *n, art_callback cb,
     }
     return 1;
 }
+
 
 
 /**
